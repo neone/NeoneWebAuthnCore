@@ -1,5 +1,6 @@
 import Foundation
 import Crypto
+import _CryptoExtras
 import Testing
 @testable import NeoneWebAuthnCore
 
@@ -91,21 +92,6 @@ struct SignatureVerifierTests {
         }
     }
 
-    @Test("RS256 is not yet implemented — throws unsupportedAlgorithm")
-    func rs256Unsupported() throws {
-        // Until NEO-1191 lands an RSA verifier, RS256 is a fail-fast stub.
-        // This test pins that behavior so we know to remove it when the
-        // upgrade lands.
-        #expect(throws: WebAuthnError.unsupportedAlgorithm) {
-            _ = try WebAuthn.verifySignature(
-                Data([0x00]),
-                over: Data([0x00]),
-                publicKey: "ignored.ignored",
-                algorithm: COSEAlgorithm.rs256
-            )
-        }
-    }
-
     @Test("Unknown algorithm throws unsupportedAlgorithm")
     func unknownAlgorithm() throws {
         #expect(throws: WebAuthnError.unsupportedAlgorithm) {
@@ -114,6 +100,114 @@ struct SignatureVerifierTests {
                 over: Data([0x00]),
                 publicKey: "ignored",
                 algorithm: -999
+            )
+        }
+    }
+}
+
+// MARK: - RS256
+
+@Suite("RS256 sign/verify round-trip")
+struct RS256SignatureVerifierTests {
+
+    /// Produce a stored-key string in the format `parseRS256Key` writes:
+    /// `"base64(n).base64(e)"`. Uses `getKeyPrimitives()` from swift-crypto
+    /// _CryptoExtras to extract the modulus and exponent.
+    private func storedKeyString(for publicKey: _RSA.Signing.PublicKey) throws -> String {
+        let primitives = try publicKey.getKeyPrimitives()
+        return primitives.modulus.base64EncodedString() + "." + primitives.publicExponent.base64EncodedString()
+    }
+
+    @Test("Valid PKCS1-v1_5 signature verifies against original message")
+    func validSignature() throws {
+        let privateKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let message = Data("hello rs256 passkey".utf8)
+
+        // WebAuthn RS256 = RSASSA-PKCS1-v1_5 over the SHA256 digest.
+        let digest = SHA256.hash(data: message)
+        let signature = try privateKey.signature(for: digest, padding: .insecurePKCS1v1_5)
+
+        let stored = try storedKeyString(for: privateKey.publicKey)
+        let valid = try WebAuthn.verifySignature(
+            signature.rawRepresentation,
+            over: message,
+            publicKey: stored,
+            algorithm: COSEAlgorithm.rs256
+        )
+        #expect(valid)
+    }
+
+    @Test("Tampered message returns false (doesn't throw)")
+    func tamperedMessage() throws {
+        let privateKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let stored = try storedKeyString(for: privateKey.publicKey)
+        let signature = try privateKey.signature(
+            for: SHA256.hash(data: Data("hello".utf8)),
+            padding: .insecurePKCS1v1_5
+        )
+
+        let valid = try WebAuthn.verifySignature(
+            signature.rawRepresentation,
+            over: Data("world".utf8),
+            publicKey: stored,
+            algorithm: COSEAlgorithm.rs256
+        )
+        #expect(valid == false)
+    }
+
+    @Test("Signature from a different key returns false")
+    func wrongKey() throws {
+        let signingKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let otherKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let message = Data("hello".utf8)
+
+        let signature = try signingKey.signature(
+            for: SHA256.hash(data: message),
+            padding: .insecurePKCS1v1_5
+        )
+        let storedOther = try storedKeyString(for: otherKey.publicKey)
+
+        let valid = try WebAuthn.verifySignature(
+            signature.rawRepresentation,
+            over: message,
+            publicKey: storedOther,
+            algorithm: COSEAlgorithm.rs256
+        )
+        #expect(valid == false)
+    }
+
+    @Test("Malformed stored key (no dot separator) throws invalidPublicKey")
+    func malformedStoredKey_noDot() throws {
+        #expect(throws: WebAuthnError.invalidPublicKey) {
+            _ = try WebAuthn.verifySignature(
+                Data([0xAB]),
+                over: Data("x".utf8),
+                publicKey: "no-dot-here",
+                algorithm: COSEAlgorithm.rs256
+            )
+        }
+    }
+
+    @Test("Malformed stored key (empty modulus) throws invalidPublicKey")
+    func malformedStoredKey_emptyModulus() throws {
+        #expect(throws: WebAuthnError.invalidPublicKey) {
+            _ = try WebAuthn.verifySignature(
+                Data([0xAB]),
+                over: Data("x".utf8),
+                publicKey: ".AQAB", // empty modulus before dot, "AQAB" = exponent 65537
+                algorithm: COSEAlgorithm.rs256
+            )
+        }
+    }
+
+    @Test("Malformed stored key (non-base64 bytes) throws invalidPublicKey")
+    func malformedStoredKey_nonBase64() throws {
+        #expect(throws: WebAuthnError.invalidPublicKey) {
+            _ = try WebAuthn.verifySignature(
+                Data([0xAB]),
+                over: Data("x".utf8),
+                publicKey: "!!!.???",
+                algorithm: COSEAlgorithm.rs256
             )
         }
     }
